@@ -1,0 +1,37 @@
+services:
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+
+    command: server /data --console-address ":9001"
+
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+    volumes:
+      - ./warehouse:/data
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+
+    container_name: nessie
+
+    ports:
+      - "19120:19120"
+      
+    environment:
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://warehouse/
+      nessie.catalog.service.s3.default-options.endpoint: http://minio:9000
+      nessie.catalog.service.s3.default-options.path-style-access: "true"
+      nessie.catalog.service.s3.default-options.auth-type: STATIC
+      nessie.catalog.service.s3.default-options.region: us-east-1
+      nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:minio-creds
+      minio-creds.name: admin
+      minio-creds.secret: password123
