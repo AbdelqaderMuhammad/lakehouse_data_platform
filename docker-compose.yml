@@ -1,88 +1,108 @@
 services:
-  postgres:
-    image: postgres:16.8
-    container_name: postgres
 
-    environment:
-      POSTGRES_DB: nessie
-      POSTGRES_USER: nessie
-      POSTGRES_PASSWORD: nessie
-
-    ports:
-      - "5432:5432"
-
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+  # ─────────────────────────────────────────────
+  # MinIO — S3-compatible object storage
+  # UI:  http://localhost:9001  (minioadmin / minioadmin)
+  # API: http://localhost:9000
+  # ─────────────────────────────────────────────
   minio:
-    image: minio/minio:RELEASE.2025-04-08T15-41-24Z
+    image: minio/minio:latest
     container_name: minio
-
-    environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: password123
-
     ports:
       - "9000:9000"
       - "9001:9001"
-
-    healthcheck:
-      test: ["CMD", "minio", "server", "health", "live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    entrypoint: |
-      /bin/sh -c "
-      (
-        sleep 3
-        until mc alias set batman http://localhost:9000 admin password123; do 
-          sleep 1
-        done
-        mc mb batman/warehouse --ignore-existing
-      ) &
-      minio server /data --console-address ':9001'
-      "
-
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
 
-  nessie:
-    image: ghcr.io/projectnessie/nessie:0.107.6
-    container_name: nessie
-
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
     depends_on:
-      postgres:
-        condition: service_started
       minio:
         condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/warehouse &&
+        echo 'Bucket warehouse is ready.'
+      "
+    networks:
+      - lakehouse
 
+  # ─────────────────────────────────────────────
+  # Iceberg REST catalog — Apache official fixture
+  # API: http://localhost:8181
+  # ─────────────────────────────────────────────
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:latest
+    container_name: iceberg-rest
     ports:
-      - "19120:19120"
-  
+      - "8181:8181"
     environment:
-      nessie.version.store.type: JDBC2
-      quarkus.datasource.db-kind: postgresql
-      quarkus.datasource.username: nessie
-      quarkus.datasource.password: nessie
-      quarkus.datasource.jdbc.url: jdbc:postgresql://postgres:5432/nessie
-      nessie.catalog.default-warehouse: warehouse
-      nessie.catalog.warehouses.warehouse.location: s3://warehouse/
-      nessie.catalog.service.s3.default-options.endpoint: http://minio:9000
-      nessie.catalog.service.s3.default-options.path-style-access: "true"
-      nessie.catalog.service.s3.default-options.auth-type: STATIC
-      nessie.catalog.service.s3.default-options.region: us-east-1
-      nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:minio-creds
-      minio-creds.name: admin
-      minio-creds.secret: password123
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/v1/config"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - lakehouse
 
-  python-dev:
-    image: python:3.12
-    container_name: python-dev
-    working_dir: /app
+  # ─────────────────────────────────────────────
+  # Jupyter — Python dev environment with PyIceberg
+  # URL: http://localhost:8888  (token: iceberg)
+  # ─────────────────────────────────────────────
+  jupyter:
+    build:
+      context: .
+      dockerfile: jupyter.Dockerfile
+    container_name: jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_TOKEN: iceberg
+      PYICEBERG_CATALOG__DEFAULT__TYPE: rest
+      PYICEBERG_CATALOG__DEFAULT__URI: http://iceberg-rest:8181
+      PYICEBERG_CATALOG__DEFAULT__WAREHOUSE: s3://warehouse/
+      PYICEBERG_CATALOG__DEFAULT__S3__ENDPOINT: http://minio:9000
+      PYICEBERG_CATALOG__DEFAULT__S3__PATH_STYLE_ACCESS: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
     volumes:
-      - ./:/app
-    command: /bin/sh -c "pip install pyiceberg[s3,nessie] pandas requests s3fs pyarrow && tail -f /dev/null"
-
+      - ./notebooks:/home/jovyan/work
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+    networks:
+      - lakehouse
 
 volumes:
-  postgres_data:
   minio_data:
+
+networks:
+  lakehouse:
+    driver: bridge
