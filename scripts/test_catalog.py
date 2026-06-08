@@ -7,3 +7,4 @@ catalog = load_catalog(
 )
 
 print(catalog.list_namespaces())
+print(catalog.list_tables(("demo",)))
