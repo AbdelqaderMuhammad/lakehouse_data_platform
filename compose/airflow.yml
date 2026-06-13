@@ -1,0 +1,167 @@
+# ─────────────────────────────────────────────────────────────
+# Airflow 3 services — LocalExecutor + Postgres metadata DB
+# Included via docker-compose.yml root file.
+#
+# UI: http://localhost:8080  (admin / admin)
+# ─────────────────────────────────────────────────────────────
+
+x-airflow-common: &airflow-common
+  build:
+    context: ../
+    dockerfile: airflow.Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-api-server:8080/execution/'
+    AIRFLOW__CORE__INTERNAL_API_SECRET_KEY: '097eea31ea90ee2db49043f39ba2a26bd6877918e1a1bdf256ff87da9d4cf947' 
+    AIRFLOW__API__JWT_SECRET: '0d628dee3055002e2ea6e15ac54c62c2'
+    AIRFLOW__API_AUTH__JWT_SECRET: '8Y1Hco3jz1euwLzJKy80h26yu-n4wFRJwwtHmYc863ZUcADEadYvPOEtbztnqPBqIhbuqWBQXc7tbnU3l_2IIg'
+    AIRFLOW__SECRETS__JWT_SECRET: '8Y1Hco3jz1euwLzJKy80h26yu-n4wFRJwwtHmYc863ZUcADEadYvPOEtbztnqPBqIhbuqWBQXc7tbnU3l_2IIg'
+    AIRFLOW__API__SECRET_KEY: '8Y1Hco3jz1euwLzJKy80h26yu-n4wFRJwwtHmYc863ZUcADEadYvPOEtbztnqPBqIhbuqWBQXc7tbnU3l_2IIg'
+    # Lakehouse connectivity
+    ICEBERG_REST_URI: http://iceberg-rest:8181
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AWS_REGION: us-east-1
+  volumes:
+    - ../airflow/dags:/opt/airflow/dags
+    - ../airflow/logs:/opt/airflow/logs
+    - ../airflow/plugins:/opt/airflow/plugins
+    - ../airflow/config:/opt/airflow/config
+  networks:
+    - lakehouse
+
+services:
+
+  # ── Airflow metadata database ──────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+
+  # ── DB migration + admin user (runs once then exits) ───────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+
+        echo "Running db migrate..."
+        airflow db migrate
+
+        echo "Creating admin user..."
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+
+        echo "Airflow 3 initialised successfully."
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── API server (replaces webserver in Airflow 3) ──────────
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: airflow-api-server
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Scheduler ─────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── DAG processor ─────────────────────────────────────────
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Triggerer ─────────────────────────────────────────────
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type TriggererJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:

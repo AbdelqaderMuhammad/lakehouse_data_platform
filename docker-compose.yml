@@ -1,3 +1,8 @@
+
+
+include:
+  - path: compose/airflow.yml
+
 services:
 
   # ─────────────────────────────────────────────
